@@ -1,0 +1,11 @@
+# 버전 고정 (2026-10-08 시험한 판)
+unoserver==3.7
+pdf2docx==0.5.13
+pymupdf==1.28.2
+pdfplumber==0.11.10
+openpyxl==3.1.5
+pypandoc==1.17
+pypandoc-hwpx==0.1.1
+python-hwpx==6.8.0
+img2pdf==0.6.3
+pillow==12.3.0
