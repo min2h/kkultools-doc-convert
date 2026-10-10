@@ -131,7 +131,24 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # 파일 이름·내용은 남기지 않아요 (경로·상태·시간만)
         pass
 
+    def _drain(self):  # 본문을 안 읽고 답하면 Cloud Run 앞단이 502로 바꿔요 → 남은 본문을 버리고 답해요
+        if self.command != 'POST' or getattr(self, '_body_read', False): return
+        self._body_read = True
+        n = self.headers.get('content-length') or ''
+        if not n.isdigit() or int(n) > MAX_BYTES + (1 << 20):
+            self.close_connection = True; return
+        left = int(n)
+        try:
+            self.connection.settimeout(30)
+            while left:
+                c = self.rfile.read(min(left, 1 << 20))
+                if not c: break
+                left -= len(c)
+        except OSError:
+            self.close_connection = True
+
     def _json(self, status, code):
+        self._drain()
         b = json.dumps({'ok': False, 'error': code}).encode()
         self.send_response(status); self.send_header('content-type', 'application/json'); self.send_header('content-length', str(len(b))); self.end_headers(); self.wfile.write(b)
 
@@ -169,6 +186,7 @@ class H(BaseHTTPRequestHandler):
                 chunk = self.rfile.read(min(left, 1 << 20))
                 if not chunk: raise ConnectionError('short body')
                 buf += chunk; left -= len(chunk)
+            self._body_read = True
             data = bytes(buf); del buf
             if compat:
                 name, data = parse_multipart_file(data, self.headers.get('content-type'))
