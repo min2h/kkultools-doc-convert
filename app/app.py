@@ -36,6 +36,7 @@ RESTART_AFTER = int(os.environ.get("LO_RESTART_AFTER", "20"))
 
 CTYPES = {
     "pdf": "application/pdf",
+    "svg": "image/svg+xml",
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -255,10 +256,17 @@ class H(BaseHTTPRequestHandler):
             with open(src, "wb") as f:
                 f.write(data)
             del data
-            uno.ensure()
-            uno.count += 1
+            is_cad = docfmt.family(src_ext) == "cad"
+            if not is_cad:  # CAD does not use LibreOffice
+                uno.ensure()
+                uno.count += 1
             out_path = os.path.join(work, "result.bin")
             env = dict(os.environ, UNO_PORT=UNO_PORT, HOME=work, TMPDIR=work)
+            if is_cad:
+                import cadconv
+
+                env["CAD_OPTS"] = json.dumps(cadconv.parse_opts({k: v[0] for k, v in q.items()}))
+                env["XDG_CACHE_HOME"] = work
             cmd = [
                 sys.executable,
                 os.path.join(os.path.dirname(__file__), "docfmt_cli.py"),
@@ -277,11 +285,12 @@ class H(BaseHTTPRequestHandler):
                     start_new_session=True,
                 )
             except subprocess.TimeoutExpired:
-                uno.count = RESTART_AFTER  # LibreOffice may be wedged
+                if not is_cad:
+                    uno.count = RESTART_AFTER  # LibreOffice may be wedged
                 status, reason = 504, "timeout"
                 return self._json(504, "timeout")
             if r.returncode != 0 or not os.path.exists(out_path):
-                uno.count = RESTART_AFTER if r.returncode < 0 else uno.count
+                uno.count = RESTART_AFTER if r.returncode < 0 and not is_cad else uno.count
                 err = r.stderr.decode(errors="replace").strip().splitlines() or ["?"]
                 status, reason = 422, err[-1][:200]
                 return self._json(422, "convert_failed")

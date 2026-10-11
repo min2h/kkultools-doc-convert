@@ -23,6 +23,7 @@ CALC = {"xlsx", "xls", "ods", "csv", "cell"}
 IMPRESS = {"pptx", "ppt", "odp"}
 IMAGES = {"png", "jpg"}
 PDF = {"pdf"}
+CAD = {"dxf"}  # beta: ezdxf (app/cadconv.py); DWG deferred
 
 TARGETS = {
     "writer": ["pdf", "docx", "hwpx", "hwp", "odt", "doc", "rtf", "txt", "html", "md", "png"],
@@ -30,6 +31,7 @@ TARGETS = {
     "impress": ["pdf", "pptx", "ppt", "odp", "png"],
     "pdf": ["docx", "xlsx", "hwpx", "txt", "png", "jpg"],
     "image": ["pdf"],
+    "cad": ["pdf", "png", "svg"],
 }
 
 LO_WRITER_OUT = {
@@ -72,6 +74,8 @@ def family(ext):
         return "pdf"
     if ext in IMAGES:
         return "image"
+    if ext in CAD:
+        return "cad"
     return None
 
 
@@ -463,12 +467,45 @@ def convert(src, src_ext, dst_ext, work):
         if dst_ext in ("png", "jpg"):
             return pages_to_images(pdf, dst_ext, work)
 
+    if fam == "cad":
+        return cad_convert(src, src_ext, dst_ext, work)
+
     if fam == "image":
         out = os.path.join(work, "out.pdf")
         run(["img2pdf", "--pagesize", "A4", "--fit", "into", "-o", out, _named(src, src_ext, work)])
         return out
 
     raise ConvertError(f"unsupported conversion: {src_ext} -> {dst_ext}")
+
+
+def cad_convert(src, src_ext, dst_ext, work):
+    """DWG/DXF -> PDF (model space + each used layout = one page each), PNG/SVG (zip when several pages).
+    Options come from the CAD_OPTS env (JSON, already whitelisted by app.py)."""
+    import json
+
+    import cadconv
+
+    opts = json.loads(os.environ.get("CAD_OPTS") or "{}")
+    src = _named(src, src_ext, work)
+    try:
+        if dst_ext == "png":
+            pdf = os.path.join(work, "cad.pdf")
+            cadconv.convert(src, pdf, opts)
+            return pages_to_images(pdf, "png", work)
+        out = os.path.join(work, f"out.{dst_ext}")
+        cadconv.convert(src, out, opts)
+    except cadconv.CadError as e:
+        raise ConvertError(str(e))
+    if dst_ext == "svg":
+        files = sorted(glob.glob(os.path.join(work, "out*.svg")))
+        if len(files) > 1:
+            z = os.path.join(work, "pages.zip")
+            with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:
+                for i, f in enumerate(files, 1):
+                    zf.write(f, f"{i:03d}.svg")
+            return z
+        return files[0]
+    return out
 
 
 def run_hwpx_from_md(src, work):

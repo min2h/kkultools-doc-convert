@@ -1,11 +1,18 @@
 # Document conversion server. Built on Gotenberg's Cloud Run image for its
 # LibreOffice, Java and CJK fonts; Gotenberg itself is not used.
+# CAD (DXF → PDF/PNG/SVG, beta): ezdxf drawing add-on (MIT) → SVG → PyMuPDF.
+# DWG is deferred (no LibreDWG in this image).
+# rhwp: reuse the binary from the known-good deployed image. Upstream v0.8.7
+# assets were repackaged (checksum drift); do not re-download / change the pin.
+ARG RHWP_FROM=asia-northeast1-docker.pkg.dev/kkultools/kkul/doc-convert@sha256:c9c0fad2e02a7e83019e462cb8f7a6f2fe5355cec671ab2dd4b55b9e433b7ec5
+FROM ${RHWP_FROM} AS rhwp-bin
+
 FROM gotenberg/gotenberg:8.37.0-libreoffice-cloudrun
 
 ARG H2ORESTART_VERSION=0.7.14
 ARG H2ORESTART_SHA256=cbea23bc37861361bbc534bc0675e5bc67b36f712072490f82a9bf410d7c04d8
+# Binary comes from rhwp-bin (known-good digest); version label kept for docs.
 ARG RHWP_VERSION=0.8.7
-ARG RHWP_SHA256=24de2bdaa0b69f86302a27e7fdfb570ad3c53b0ab3a4eac06446adc651dfb988
 
 USER root
 
@@ -35,9 +42,8 @@ RUN mkdir -p /opt/h2orestart \
  && HOME=/tmp/unopkg-home unopkg list --shared | grep -q "H2Orestart" \
  && rm -rf /tmp/* /tmp/.[!.]* /var/tmp/*
 
-RUN curl -fsSL -o /tmp/rhwp.tgz "https://github.com/edwardkim/rhwp/releases/download/v${RHWP_VERSION}/rhwp-v${RHWP_VERSION}-linux-x86_64.tar.gz" \
- && echo "${RHWP_SHA256}  /tmp/rhwp.tgz" | sha256sum -c - \
- && tar -xzf /tmp/rhwp.tgz -C /tmp && install -m 0755 /tmp/rhwp/rhwp /usr/local/bin/rhwp && rm -rf /tmp/*
+# rhwp from pinned known-good image (do not curl upstream — asset checksum drift).
+COPY --from=rhwp-bin /usr/local/bin/rhwp /usr/local/bin/rhwp
 
 # --system-site-packages so the venv can import LibreOffice's python3-uno.
 COPY app/requirements.txt /opt/kkul/requirements.txt

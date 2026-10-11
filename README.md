@@ -14,7 +14,7 @@ HTTP server that converts between HWP/HWPX, Office, ODF, PDF, Markdown and image
 
 Multi-page images and multi-sheet CSV are returned as a zip. Conversions to HWP/HWPX and from PDF to DOCX/HWPX are less reliable than the rest. Password-protected files, HWP 3.0 and older, and OCR are not supported.
 
-Built on LibreOffice with [H2Orestart](https://github.com/ebandal/H2Orestart), [rhwp](https://github.com/edwardkim/rhwp), [pypandoc-hwpx](https://pypi.org/project/pypandoc-hwpx/), pandoc, [pdf2docx](https://github.com/ArtifexSoftware/pdf2docx), [pdfplumber](https://github.com/jsvine/pdfplumber), poppler and img2pdf.
+Built on LibreOffice with [H2Orestart](https://github.com/ebandal/H2Orestart), [rhwp](https://github.com/edwardkim/rhwp), [pypandoc-hwpx](https://pypi.org/project/pypandoc-hwpx/), pandoc, [pdf2docx](https://github.com/ArtifexSoftware/pdf2docx), [pdfplumber](https://github.com/jsvine/pdfplumber), poppler and img2pdf. CAD (DXF → PDF/PNG/SVG, beta) uses [ezdxf](https://github.com/mozman/ezdxf). DWG support is deferred.
 
 ## Running with Docker
 
@@ -60,4 +60,4 @@ The server handles one conversion at a time. Uploaded files are kept in a per-re
 
 ## License
 
-AGPL-3.0, see [LICENSE](LICENSE). The AGPL applies because PyMuPDF (used by pdf2docx) is AGPL. Bundled components keep their own licenses: LibreOffice (MPL-2.0), H2Orestart (GPL-3.0), rhwp (MIT), pandoc (GPL-2.0+), pdfplumber (MIT), fonts (OFL/GPL).
+AGPL-3.0, see [LICENSE](LICENSE). The AGPL applies because PyMuPDF (used by pdf2docx) is AGPL. Bundled components keep their own licenses: LibreOffice (MPL-2.0), H2Orestart (GPL-3.0), rhwp (MIT), pandoc (GPL-2.0+), pdfplumber (MIT), ezdxf (MIT), fonts (OFL/GPL).
