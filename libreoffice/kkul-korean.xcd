@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- 꿀툴: LibreOffice 기본 언어를 한국어로 — 언어 표시가 없는 한글이 중국어(간체) 글꼴·문장부호 규칙으로 그려지지 않게 해요. -->
+<!-- Default locale ko-KR so untagged Hangul is not rendered with Simplified Chinese fonts and punctuation rules. -->
 <oor:data xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:oor="http://openoffice.org/2001/registry">
   <dependency file="main"/>
   <oor:component-data oor:name="Setup" oor:package="org.openoffice">

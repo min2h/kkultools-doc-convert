@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- 꿀툴 v2: Gotenberg가 하던 보호를 LibreOffice 설정으로 — 매크로 끄기, 문서 속 외부 링크·그림 불러오지 않기 -->
+<!-- Disable macros and block external links/images in documents. -->
 <oor:data xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:oor="http://openoffice.org/2001/registry">
   <dependency file="main"/>
   <oor:component-data oor:name="Common" oor:package="org.openoffice.Office">

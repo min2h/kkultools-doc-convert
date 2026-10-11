@@ -1,7 +1,5 @@
-# 꿀툴 문서 변환 서버 v2 (any → any). deploy.sh가 이 파일을 빌드해요 (예전 Gotenberg 버전은 Dockerfile.v1).
-#  - 바탕: 지금과 같은 Gotenberg Cloud Run 이미지(LibreOffice 26.8·자바·Noto CJK). Gotenberg 프로그램은 쓰지 않고 app/app.py가 받아요.
-#  - 더하는 것: H2Orestart(HWP·HWPX 읽기, v1과 같음) · rhwp(HWP↔HWPX, MIT) · pandoc · pypandoc-hwpx(→HWPX, MIT)
-#               pdf2docx(PDF→DOCX, PyMuPDF=AGPL) · pdfplumber(PDF→XLSX, MIT) · poppler-utils · img2pdf · unoserver
+# Document conversion server. Built on Gotenberg's Cloud Run image for its
+# LibreOffice, Java and CJK fonts; Gotenberg itself is not used.
 FROM gotenberg/gotenberg:8.37.0-libreoffice-cloudrun
 
 ARG H2ORESTART_VERSION=0.7.14
@@ -11,7 +9,7 @@ ARG RHWP_SHA256=24de2bdaa0b69f86302a27e7fdfb570ad3c53b0ab3a4eac06446adc651dfb988
 
 USER root
 
-# Debian 미러(특히 backports)가 가끔 500을 내요 → 받기·설치를 최대 5번까지 다시 시도해요.
+# Debian mirrors (backports in particular) fail intermittently.
 RUN set -e; export DEBIAN_FRONTEND=noninteractive; \
     printf 'Acquire::Retries "5";\nAcquire::http::Timeout "60";\n' >/etc/apt/apt.conf.d/80kkul-retries; \
     for i in 1 2 3 4 5; do \
@@ -19,7 +17,7 @@ RUN set -e; export DEBIAN_FRONTEND=noninteractive; \
          && apt-get install -y -qq --no-install-recommends -t trixie-backports libreoffice-java-common \
          && apt-get install -y -qq --no-install-recommends \
               fonts-nanum fonts-nanum-extra fonts-unfonts-core python3-venv pandoc poppler-utils; then ok=1; break; fi; \
-      echo "apt 실패 ($i/5) — $((i * 15))초 뒤 다시 시도" >&2; sleep $((i * 15)); \
+      echo "apt failed ($i/5), retrying in $((i * 15))s" >&2; sleep $((i * 15)); \
     done; \
     [ "${ok:-}" = 1 ]; \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
@@ -37,27 +35,26 @@ RUN mkdir -p /opt/h2orestart \
  && HOME=/tmp/unopkg-home unopkg list --shared | grep -q "H2Orestart" \
  && rm -rf /tmp/* /tmp/.[!.]* /var/tmp/*
 
-# rhwp (https://github.com/edwardkim/rhwp, MIT) — 정적 바이너리 하나, 버전·체크섬 고정
 RUN curl -fsSL -o /tmp/rhwp.tgz "https://github.com/edwardkim/rhwp/releases/download/v${RHWP_VERSION}/rhwp-v${RHWP_VERSION}-linux-x86_64.tar.gz" \
  && echo "${RHWP_SHA256}  /tmp/rhwp.tgz" | sha256sum -c - \
  && tar -xzf /tmp/rhwp.tgz -C /tmp && install -m 0755 /tmp/rhwp/rhwp /usr/local/bin/rhwp && rm -rf /tmp/*
 
-# 파이썬 도구 (LibreOffice의 python3-uno를 쓰려고 --system-site-packages)
+# --system-site-packages so the venv can import LibreOffice's python3-uno.
 COPY app/requirements.txt /opt/kkul/requirements.txt
 RUN python3 -m venv --system-site-packages /opt/venv \
  && /opt/venv/bin/pip install -q --no-cache-dir -r /opt/kkul/requirements.txt \
  && find /opt/venv -name '__pycache__' -prune -exec rm -rf {} +
 
-# H2Orestart 로그(~/.cache/H2Orestart) 막기 — v1과 같음 (요청마다 HOME을 임시 폴더로 바꾸지만 기본 HOME도 막아 둬요)
+# H2Orestart logs file names to ~/.cache/H2Orestart; a read-only file there disables it.
 RUN mkdir -p /home/gotenberg/.cache && chown gotenberg:gotenberg /home/gotenberg/.cache \
  && touch /home/gotenberg/.cache/H2Orestart && chown root:root /home/gotenberg/.cache/H2Orestart && chmod 0444 /home/gotenberg/.cache/H2Orestart
 
 COPY app/ /opt/kkul/app/
 
-# LibreOffice 프로필을 미리 만들어 둬요 (첫 실행 때 확장 등록·설정 캐시를 만드는 몇 초를 빌드 때 끝내요).
-# 실행할 때는 이 폴더를 임시 폴더로 복사해서 써요(읽기 전용 그대로 쓰지 않아요). Writer·Calc·Impress·HWP(H2Orestart)를 한 번씩 열어 둬요.
+# Prebuild a LibreOffice profile (extension registration, config cache) to speed up
+# cold starts. It is copied to a temp dir at runtime.
 RUN set -e; mkdir -p /opt/kkul/lo-profile /tmp/warm && cd /tmp/warm; \
-    printf '# warm\n\nhello 꿀툴\n' >w.md; \
+    printf '# warm\n\nhello 한글\n' >w.md; \
     pandoc w.md -o w.docx; printf 'a,b\n1,2\n' >c.csv; \
     /opt/venv/bin/pypandoc-hwpx w.md -o w.hwpx >/dev/null 2>&1 || true; \
     rhwp convert w.hwpx h.hwp >/dev/null 2>&1 || true; \
@@ -78,6 +75,5 @@ ENV PATH=/opt/venv/bin:$PATH \
     RHWP_MEM_BYTES=1258291200 \
     PYTHONDONTWRITEBYTECODE=1
 USER gotenberg
-# 비밀값: Cloud Run --set-secrets "CONVERT_SECRET=doc-convert-secret:latest" (v1의 GOTENBERG_API_BASIC_AUTH_PASSWORD 이름도 읽어요)
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python3", "/opt/kkul/app/app.py"]

@@ -1,4 +1,4 @@
-# 버전 고정 (2026-10-08 시험한 판)
+# Pinned versions
 unoserver==3.7
 pdf2docx==0.5.13
 pymupdf==1.28.2
