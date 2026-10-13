@@ -1,5 +1,6 @@
-"""CAD (DWG/DXF) -> PDF/SVG/PNG.  LibreDWG dwg2dxf (GPLv3) + ezdxf drawing add-on (MIT) + PyMuPDF (AGPL).
-Beta: 2D only (3D solids/ACIS are not drawn), missing xrefs/images are skipped, SHX fonts become TTF outlines.
+"""CAD (DWG/DXF/DWFx) -> PDF/SVG/PNG.  LibreDWG dwg2dxf (GPLv3) + ezdxf drawing add-on (MIT) + PyMuPDF (AGPL).
+2D only (3D solids/ACIS are not drawn), missing xrefs/images are skipped, SHX fonts become TTF outlines.
+DWFx is XPS underneath, so its 2D sheets are rendered by MuPDF.  Classic DWF (W2D streams) is not supported.
 Pages: model space (if not empty) + every paper-space layout that has entities.
 Options: mono (black on white), page=auto|a4|a3 ..., orient=auto|portrait|landscape.
 """
@@ -23,18 +24,36 @@ PAGE_MM = {"a4": (210, 297), "a3": (297, 420), "a2": (420, 594), "a1": (594, 841
 
 
 class CadError(Exception):
-    pass
+    """str(e) is for logs; e.code is the user-facing error code (see worker CAD_ERRORS)."""
+
+    def __init__(self, msg, code="cad_failed"):
+        super().__init__(msg)
+        self.code = code
+
+
+# DWG header -> release.  R13-R2018+ are read by LibreDWG; R12 and older (and unknown) are rejected.
+DWG_RELEASES = {"AC1012": "R13", "AC1014": "R14", "AC1015": "2000", "AC1018": "2004", "AC1021": "2007",
+                "AC1024": "2010", "AC1027": "2013", "AC1032": "2018"}
+
+
+def dwg_release(path: str) -> str:
+    with open(path, "rb") as f:
+        head = f.read(6).decode("latin-1")
+    if head not in DWG_RELEASES:
+        raise CadError(f"unsupported DWG version {head!r}", "cad_dwg_version")
+    return DWG_RELEASES[head]
 
 
 DWG_MEM = int(os.environ.get("DWG_MEM_BYTES", str(1200 * 1024 * 1024)))
 
 
 def dwg_to_dxf(src: str, workdir: str, timeout: int = 60) -> str:
+    dwg_release(src)
     out = os.path.join(workdir, "conv.dxf")
     p = subprocess.run(["prlimit", f"--as={DWG_MEM}", "--", "dwg2dxf", "-y", "-o", out, src],
                        capture_output=True, timeout=timeout)
     if not os.path.exists(out) or os.path.getsize(out) < 100:
-        raise CadError("dwg2dxf failed: " + p.stderr.decode(errors="replace")[-400:])
+        raise CadError("dwg2dxf failed: " + p.stderr.decode(errors="replace")[-400:], "cad_read")
     return out
 
 
@@ -42,7 +61,7 @@ def load(path: str):
     try:
         doc, auditor = recover.readfile(path)
     except Exception as e:  # noqa
-        raise CadError(f"cannot read DXF: {e}")
+        raise CadError(f"cannot read DXF: {e}", "cad_read")
     return doc, auditor
 
 
@@ -72,20 +91,25 @@ def fix_korean_fonts(doc) -> int:
 
 
 def _page_for(lay, opts, is_model):
+    """Paper size in mm.  Lineweights are absolute mm on this paper, so the page must be a real
+    sheet: the old auto page was 1 drawing unit = 1 mm, which made metre/inch drawings a few cm wide
+    and every 0.25-0.7 mm line a blob.  Model space -> A3 (or the chosen size), layouts -> their own
+    plot paper when it looks sane, else A3."""
     pg = opts.get("page", "auto")
     orient = opts.get("orient", "auto")
-    m = layout.Margins.all(5)
+    m = layout.Margins.all(8)
     if pg in PAGE_MM:
         w, h = PAGE_MM[pg]
         return layout.Page(w, h, layout.Units.mm, margins=m), orient
     if not is_model:
         try:
             p = layout.Page.from_dxf_layout(lay)
-            if p.width > 1 and p.height > 1:
+            if 50 <= p.width_in_mm <= 2500 and 50 <= p.height_in_mm <= 2500:
                 return p, orient
         except Exception:
             pass
-    return layout.Page(0, 0, layout.Units.mm, margins=m, max_width=841, max_height=1189), orient  # auto, cap A0
+    w, h = PAGE_MM["a3"]
+    return layout.Page(w, h, layout.Units.mm, margins=m), orient
 
 
 def _orient(page, orient, box):
@@ -121,6 +145,24 @@ def inline_svg_classes(svg: str) -> str:
             parts.append(f'{k}="{v}"')
         attrs[name] = " ".join(parts)
     return re.sub(r'class="(C[0-9A-Za-z]+)"', lambda m: attrs.get(m.group(1), m.group(0)), svg)
+
+
+_HEX = re.compile(r"#([0-9a-fA-F]{6})\b")
+
+
+def _legible(m):
+    """Screen colours like yellow (2), cyan (4) or light grey (8/9) vanish on white paper.
+    Darken anything brighter than ~60% luminance, keeping the hue (what viewers do on a white background)."""
+    r, g, b = (int(m.group(1)[i:i + 2], 16) for i in (0, 2, 4))
+    lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+    if lum <= 0.6 or (r, g, b) == (255, 255, 255):
+        return m.group(0)
+    k = 0.45 / lum
+    return "#%02x%02x%02x" % tuple(min(255, int(c * k)) for c in (r, g, b))
+
+
+def legible_colors(svg: str) -> str:
+    return re.sub(r"<style>[^<]*</style>", lambda m: _HEX.sub(_legible, m.group(0)), svg)
 
 
 def _saved_view_box(doc):
@@ -183,6 +225,8 @@ def _render_one(doc, lay, is_model, cfg, opts, fmt):
             page = _orient(page, "landscape" if rbox.size.x >= rbox.size.y else "portrait", None)
     st = layout.Settings(fit_page=True, scale=1, crop_at_margins=rbox is not None)
     svg_s = be.get_string(page, settings=st, render_box=rbox)
+    if not opts.get("mono"):
+        svg_s = legible_colors(svg_s)
     if fmt == "svg":
         return svg_s.encode()
     svg = inline_svg_classes(svg_s).encode()
@@ -213,6 +257,8 @@ def render(doc, opts=None, fmt="pdf"):
         background_policy=config.BackgroundPolicy.WHITE,
         color_policy=config.ColorPolicy.BLACK if opts.get("mono") else config.ColorPolicy.COLOR,
         lineweight_policy=config.LineweightPolicy.ABSOLUTE,
+        min_lineweight=1.2,  # 1/300 inch -> 0.1 mm hairline floor on paper
+        lineweight_scaling=1.0,
         hatching_timeout=20,
         min_hatch_line_distance=_min_hatch_distance(doc),
     )
@@ -228,7 +274,14 @@ def render(doc, opts=None, fmt="pdf"):
             if any(e.dxftype() != "VIEWPORT" for e in psp) or len(psp.viewports()) > 1:
                 layouts.append((psp, False))
     if not layouts:
-        raise CadError("drawing is empty")
+        raise CadError("drawing is empty", "cad_empty")
+    solid = {"3DSOLID", "BODY", "REGION", "SURFACE", "EXTRUDEDSURFACE", "LOFTEDSURFACE", "REVOLVEDSURFACE",
+             "SWEPTSURFACE", "PLANESURFACE", "NURBSURFACE", "MESH", "LIGHT"}
+    types = [e.dxftype() for e in msp]
+    paper_2d = any(not m and any(e.dxftype() != "VIEWPORT" for e in lay) for lay, m in layouts)
+    if types and sum(t in solid for t in types) / len(types) >= 0.5 and not paper_2d:
+        # a 3D model with a few stray lines would come out as an almost blank page
+        raise CadError("3D model (ACIS solids) - nothing meaningful to plot in 2D", "cad_3d")
     pages, errors = [], []
     for lay, is_model in layouts:
         try:
@@ -238,7 +291,7 @@ def render(doc, opts=None, fmt="pdf"):
     render.errors = errors
     if not pages:
         if any("NaN" in e or "empty bounding box" in e for e in errors):
-            raise CadError("no 2D content we can draw (3D solids/ACIS or empty viewports only)")
+            raise CadError("no 2D content we can draw (3D solids/ACIS or empty viewports only)", "cad_3d")
         raise CadError("nothing rendered: " + "; ".join(errors)[:300])
     if fmt != "pdf":
         return pages
@@ -264,10 +317,104 @@ def parse_opts(q: dict) -> dict:
     return o
 
 
+def _fallback_font() -> bytes:
+    for p in ("/usr/share/fonts/truetype/nanum/NanumGothic.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+        if os.path.exists(p):
+            return open(p, "rb").read()
+    return b""
+
+
+def fix_dwfx_fonts(src: str, dst: str) -> int:
+    """Autodesk DWFx writers embed subset fonts whose Unicode cmap is empty while the <Glyphs> use
+    UnicodeString only, so every character comes out as a .notdef box.  Swap such fonts for a
+    complete one (NanumGothic: Latin + Hangul).  Returns how many fonts were replaced."""
+    import io, zipfile
+    from fontTools.ttLib import TTFont
+    fb, n = _fallback_font(), 0
+    with zipfile.ZipFile(src) as zi, zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zo:
+        for it in zi.infolist():
+            data = zi.read(it)
+            if fb and it.filename.lower().endswith(".ttf"):
+                try:
+                    t = TTFont(io.BytesIO(data), lazy=True)
+                    if not any(c.isUnicode() and c.cmap for c in t["cmap"].tables):
+                        data, n = fb, n + 1
+                except Exception:
+                    pass
+            zo.writestr(it, data)
+    return n
+
+
+def dwfx_to_pdf(src: str) -> tuple[bytes, int]:
+    """DWFx = XPS package.  Keep the 2D sheets, crop each to its drawing (DWFx writers often declare a
+    Letter FixedPage and draw the plot inside it), drop Autodesk's 'additional content' notice and the
+    tiny 3D thumbnails of eModel sections."""
+    fixed = src + ".fonts.xps"
+    try:
+        if fix_dwfx_fonts(src, fixed):
+            src = fixed
+    except Exception:
+        pass
+    try:
+        xps = fitz.open(src, filetype="xps")
+    except Exception as e:
+        raise CadError(f"cannot open DWFx: {e}", "cad_read")
+    out = fitz.open()
+    with xps:
+        pdf = fitz.open("pdf", xps.convert_to_pdf())
+    for pg in pdf:
+        r = pg.rect
+        if min(r.width, r.height) < 216:  # 3D eModel textures/thumbnails (< 3 inch); real sheets are >= A5
+            continue
+        txt = " ".join(pg.get_text().replace("\xa0", " ").split())
+        if "Additional Content Available" in txt and len(txt) < 600:
+            continue
+        box = fitz.Rect()
+        for kind, b in pg.get_bboxlog():
+            if kind.startswith("ignore"):
+                continue
+            b = fitz.Rect(b) & r
+            if b.is_empty:
+                continue
+            # skip tiny registration ticks in the page corners, they defeat the crop
+            edge = 0.08 * min(r.width, r.height)
+            if b.width < 0.02 * r.width and b.height < 0.02 * r.height and (
+                    b.x1 < edge or b.x0 > r.width - edge or b.y1 < edge or b.y0 > r.height - edge):
+                continue
+            box |= b
+        if box.is_empty or box.width < 36 or box.height < 36:
+            continue
+        pad = 0.02 * max(box.width, box.height)
+        box = (box + (-pad, -pad, pad, pad)) & r
+        k = max(1.0, 1190 / max(box.width, box.height))  # vector: bring small sheets up to A3
+        np_ = out.new_page(width=box.width * k, height=box.height * k)
+        np_.show_pdf_page(np_.rect, pdf, pg.number, clip=box)
+    n = out.page_count
+    if not n:
+        raise CadError("DWFx has no 2D sheets (3D model only)", "cad_3d")
+    out.set_metadata({"producer": "kkultools CAD (DWFx/XPS via MuPDF)"})
+    return out.tobytes(deflate=True, garbage=3), n
+
+
 def convert(src: str, dst: str, opts=None):
     opts = opts or {}
     ext = os.path.splitext(src)[1].lower()
     info = {}
+    if ext == ".dwf":
+        raise CadError("classic DWF (W2D) is not supported", "cad_dwf")
+    if ext == ".dwfx":
+        fmt = os.path.splitext(dst)[1].lstrip(".").lower()
+        if fmt not in ("pdf", "png"):
+            raise CadError("DWFx converts to PDF/PNG only", "cad_failed")
+        pdf, n = dwfx_to_pdf(src)
+        if fmt == "pdf":
+            open(dst, "wb").write(pdf)
+        else:
+            with fitz.open("pdf", pdf) as d:
+                base, e = os.path.splitext(dst)
+                for i, p in enumerate(d, 1):
+                    p.get_pixmap(dpi=150, alpha=False).save(dst if n == 1 else f"{base}-{i}{e}")
+        return {"pages": n}
     with tempfile.TemporaryDirectory() as td:
         t0 = time.time()
         path = src
@@ -311,7 +458,7 @@ if __name__ == "__main__":
         info = convert(files[0], files[1], opts)
         info["ok"] = True
     except Exception as e:
-        info = {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]}
+        info = {"ok": False, "error": f"{type(e).__name__}: {e}"[:300], "code": getattr(e, "code", None)}
     info["t_total"] = round(time.time() - t, 2)
     info["maxrss_mb"] = round(max(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss, resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss) / 1024)
     print(json.dumps(info, ensure_ascii=False))

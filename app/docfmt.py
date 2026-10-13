@@ -23,7 +23,7 @@ CALC = {"xlsx", "xls", "ods", "csv", "cell"}
 IMPRESS = {"pptx", "ppt", "odp"}
 IMAGES = {"png", "jpg"}
 PDF = {"pdf"}
-CAD = {"dxf"}  # beta: ezdxf (app/cadconv.py); DWG deferred
+CAD = {"dxf", "dwg", "dwfx", "dwf"}  # app/cadconv.py; classic DWF is rejected with cad_dwf
 
 TARGETS = {
     "writer": ["pdf", "docx", "hwpx", "hwp", "odt", "doc", "rtf", "txt", "html", "md", "png"],
@@ -495,7 +495,7 @@ def cad_convert(src, src_ext, dst_ext, work):
         out = os.path.join(work, f"out.{dst_ext}")
         cadconv.convert(src, out, opts)
     except cadconv.CadError as e:
-        raise ConvertError(str(e))
+        raise ConvertError(f"kkul:{e.code} {e}")
     if dst_ext == "svg":
         files = sorted(glob.glob(os.path.join(work, "out*.svg")))
         if len(files) > 1:

@@ -10,3 +10,4 @@ python-hwpx==6.8.0
 img2pdf==0.6.3
 pillow==12.3.0
 ezdxf==1.4.2
+fonttools==4.66.1

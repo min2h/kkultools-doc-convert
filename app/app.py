@@ -293,7 +293,8 @@ class H(BaseHTTPRequestHandler):
                 uno.count = RESTART_AFTER if r.returncode < 0 and not is_cad else uno.count
                 err = r.stderr.decode(errors="replace").strip().splitlines() or ["?"]
                 status, reason = 422, err[-1][:200]
-                return self._json(422, "convert_failed")
+                m = re.search(r"kkul:(cad_[a-z0-9_]+)", err[-1])
+                return self._json(422, m.group(1) if m else "convert_failed")
             ext = (r.stdout.decode().strip().splitlines() or [dst_ext])[-1]
             size = os.path.getsize(out_path)
             if size > MAX_OUT:

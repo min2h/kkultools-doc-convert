@@ -1,11 +1,22 @@
 # Document conversion server. Built on Gotenberg's Cloud Run image for its
 # LibreOffice, Java and CJK fonts; Gotenberg itself is not used.
-# CAD (DXF → PDF/PNG/SVG, beta): ezdxf drawing add-on (MIT) → SVG → PyMuPDF.
-# DWG is deferred (no LibreDWG in this image).
+# CAD (DXF/DWG → PDF/PNG/SVG): LibreDWG dwg2dxf (GPLv3) → ezdxf drawing add-on (MIT) → SVG → PyMuPDF.
+# LibreDWG 0.13.x drops anonymous/dynamic block inserts; 0.14 keeps them, so build that release.
 # rhwp: reuse the binary from the known-good deployed image. Upstream v0.8.7
 # assets were repackaged (checksum drift); do not re-download / change the pin.
 ARG RHWP_FROM=asia-northeast1-docker.pkg.dev/kkultools/kkul/doc-convert@sha256:c9c0fad2e02a7e83019e462cb8f7a6f2fe5355cec671ab2dd4b55b9e433b7ec5
 FROM ${RHWP_FROM} AS rhwp-bin
+
+FROM debian:trixie-slim AS libredwg
+ARG LIBREDWG_VERSION=0.14.8608
+ARG LIBREDWG_SHA256=b535df00e1ba024ad0c6e57f76529be72e7f5bb096e980ea204ac47ab9f1775f
+RUN set -e; export DEBIAN_FRONTEND=noninteractive; apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends build-essential curl ca-certificates xz-utils python3 \
+ && curl -fsSL -o /tmp/l.tar.xz "https://github.com/LibreDWG/libredwg/releases/download/${LIBREDWG_VERSION}/libredwg-${LIBREDWG_VERSION}.tar.xz" \
+ && echo "${LIBREDWG_SHA256}  /tmp/l.tar.xz" | sha256sum -c - \
+ && tar -C /tmp -xf /tmp/l.tar.xz && cd /tmp/libredwg-${LIBREDWG_VERSION} \
+ && ./configure -q --prefix=/opt/libredwg --disable-bindings --disable-dependency-tracking \
+ && make -j"$(nproc)" -s && make -s install && /opt/libredwg/bin/dwg2dxf --version
 
 FROM gotenberg/gotenberg:8.37.0-libreoffice-cloudrun
 
@@ -44,6 +55,10 @@ RUN mkdir -p /opt/h2orestart \
 
 # rhwp from pinned known-good image (do not curl upstream — asset checksum drift).
 COPY --from=rhwp-bin /usr/local/bin/rhwp /usr/local/bin/rhwp
+
+COPY --from=libredwg /opt/libredwg/bin/dwg2dxf /usr/local/bin/dwg2dxf
+COPY --from=libredwg /opt/libredwg/lib/libredwg.so.0 /usr/local/lib/
+RUN ldconfig && dwg2dxf --version
 
 # --system-site-packages so the venv can import LibreOffice's python3-uno.
 COPY app/requirements.txt /opt/kkul/requirements.txt
