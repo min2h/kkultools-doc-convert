@@ -288,6 +288,64 @@ def hwp_family_lo(src, src_ext, fmt, work):
             raise
 
 
+import xml.etree.ElementTree as ET
+
+W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+MC = "{http://schemas.openxmlformats.org/markup-compatibility/2006}"
+
+
+def docx_to_txt(docx, out):
+    """Plain text of a DOCX in reading order, including text boxes and shapes (LibreOffice's
+    text export drops them, which lost most of the Korean text in HWP→TXT)."""
+    root = ET.fromstring(zipfile.ZipFile(docx).read("word/document.xml"))
+    lines = []
+
+    def para(p):
+        buf, boxes = [], []
+
+        def walk(e):
+            for c in e:
+                if c.tag == MC + "Fallback":
+                    continue
+                if c.tag == W + "txbxContent":
+                    boxes.append(c)
+                    continue
+                if c.tag == W + "t":
+                    buf.append(c.text or "")
+                elif c.tag == W + "tab":
+                    buf.append("\t")
+                elif c.tag in (W + "br", W + "cr"):
+                    buf.append("\n")
+                walk(c)
+
+        walk(p)
+        lines.append("".join(buf))
+        for b in boxes:
+            block(b)
+
+    def block(e):
+        for c in e:
+            if c.tag == W + "p":
+                para(c)
+            elif c.tag == W + "tbl":
+                for tr in c.iter(W + "tr"):
+                    cells = []
+                    for tc in tr.findall(W + "tc"):
+                        n = len(lines)
+                        block(tc)
+                        cells.append(" ".join(l for l in lines[n:] if l.strip()))
+                        del lines[n:]
+                    lines.append("\t".join(cells))
+            elif c.tag in (W + "sdt", W + "sdtContent", W + "customXml"):
+                block(c)
+
+    block(root.find(W + "body"))
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(l.rstrip() for l in lines))
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(text.strip("\n") + "\n")
+    return out
+
+
 def pdf_to_docx(pdf, work):
     from pdf2docx import Converter
 
@@ -403,7 +461,10 @@ def convert(src, src_ext, dst_ext, work):
             rhwp("convert", hwpx, out)
             return out
         if src_ext in ("hwp", "hwpx"):
-            if dst_ext in ("odt", "html"):  # direct export breaks on some files; go through DOCX
+            if dst_ext == "txt":  # LibreOffice's text export drops text boxes; extract from DOCX
+                docx = hwp_family_lo(src, src_ext, LO_WRITER_OUT["docx"], work)
+                return docx_to_txt(docx, os.path.join(work, "out.txt"))
+            if dst_ext in ("odt", "html", "rtf"):  # direct export breaks/truncates some files; go through DOCX
                 docx = hwp_family_lo(src, src_ext, LO_WRITER_OUT["docx"], work)
                 return lo(
                     _named(docx, "docx", work, "mid"),
