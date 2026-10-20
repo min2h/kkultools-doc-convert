@@ -305,6 +305,9 @@ class H(BaseHTTPRequestHandler):
             self.send_header("content-length", str(size))
             if not compat:
                 self.send_header("x-kkul-ext", ext)
+                wf = os.path.join(work, "w", "cad_warn")
+                if is_cad and os.path.exists(wf):
+                    self.send_header("x-kkul-warn", open(wf).read()[:200])
             self.end_headers()
             with open(out_path, "rb") as f:
                 shutil.copyfileobj(f, self.wfile, 1 << 20)

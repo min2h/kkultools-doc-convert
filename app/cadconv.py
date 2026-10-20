@@ -57,9 +57,29 @@ def dwg_to_dxf(src: str, workdir: str, timeout: int = 60) -> str:
     return out
 
 
+def sniff(path: str) -> str:
+    """Real format by content: 'dwg', 'dxf' (ASCII or binary) or '' - users rename files."""
+    with open(path, "rb") as f:
+        head = f.read(64)
+    if head[:4] == b"AC10" or head[:4] == b"AC20" or head[:2] == b"MC":
+        return "dwg"
+    if head.startswith(b"AutoCAD Binary DXF"):
+        return "dxf"
+    txt = head.lstrip(b"\xef\xbb\xbf").lstrip()
+    if txt[:1] == b"0" and b"SECTION" in head or txt[:1] == b"9" or b"SECTION" in head[:32]:
+        return "dxf"
+    return ""
+
+
 def load(path: str):
     try:
-        doc, auditor = recover.readfile(path)
+        with open(path, "rb") as f:
+            binary = f.read(22).startswith(b"AutoCAD Binary DXF")
+        if binary:  # recover mode reads ASCII only
+            doc = ezdxf.readfile(path)
+            auditor = doc.audit()
+        else:
+            doc, auditor = recover.readfile(path)
     except Exception as e:  # noqa
         raise CadError(f"cannot read DXF: {e}", "cad_read")
     return doc, auditor
@@ -198,6 +218,41 @@ def _share_inside(lay, box, limit=3000):
     return inside / n if n else 0.0
 
 
+def _robust_box(lay, limit=200_000):
+    """Bounds without far-away strays: when <=2% of the entities lie far outside the box of the rest
+    (header $EXTMIN/$EXTMAX are never trusted - they are 0 or stale in many files), return that box."""
+    from ezdxf import bbox as bb
+    from ezdxf.math import BoundingBox2d, Vec2
+    boxes = []
+    for i, e in enumerate(lay):
+        if i >= limit:
+            return None
+        try:
+            b = bb.extents([e], fast=True)
+        except Exception:
+            continue
+        if b.has_data:
+            boxes.append(b)
+    n = len(boxes)
+    if n < 5:
+        return None
+    cx = sorted(b.center.x for b in boxes); cy = sorted(b.center.y for b in boxes)
+    drop = max(2, int(n * 0.02))
+    k = min(drop, n // 3)
+    lo, hi = Vec2(cx[k], cy[k]), Vec2(cx[-1 - k], cy[-1 - k])
+    span = max(hi.x - lo.x, hi.y - lo.y, 1e-9)
+    pad = span * 10
+    keep = [b for b in boxes if lo.x - pad <= b.center.x <= hi.x + pad and lo.y - pad <= b.center.y <= hi.y + pad]
+    if len(keep) == n or n - len(keep) > drop:
+        return None
+    full = bb.extents(lay, fast=True)
+    core = BoundingBox2d([p for b in keep for p in (Vec2(b.extmin), Vec2(b.extmax))])
+    if max(full.size.x, full.size.y) < 20 * max(core.size.x, core.size.y):
+        return None
+    m = max(core.size.x, core.size.y) * 0.02
+    return BoundingBox2d([core.extmin - Vec2(m, m), core.extmax + Vec2(m, m)])
+
+
 def _render_one(doc, lay, is_model, cfg, opts, fmt):
     """Render one layout to SVG (ezdxf SVGBackend: fast, text as outlines), then PDF/PNG via PyMuPDF.
     (ezdxf's PyMuPdfBackend is O(n^2)-ish on big drawings: >150 s for 100k lines.)"""
@@ -221,8 +276,12 @@ def _render_one(doc, lay, is_model, cfg, opts, fmt):
             if not ext.has_data or ext.size.x * ext.size.y < 25 * rbox.size.x * rbox.size.y \
                     or _share_inside(lay, rbox) < 0.8:
                 rbox = None
-        if rbox is not None and opts.get("orient", "auto") == "auto" and page.width and page.height:
-            page = _orient(page, "landscape" if rbox.size.x >= rbox.size.y else "portrait", None)
+    if is_model and rbox is None and view == "auto":
+        rbox = _robust_box(lay)
+        if rbox is not None:
+            _render_one.outliers = True
+    if rbox is not None and opts.get("orient", "auto") == "auto" and page.width and page.height:
+        page = _orient(page, "landscape" if rbox.size.x >= rbox.size.y else "portrait", None)
     st = layout.Settings(fit_page=True, scale=1, crop_at_margins=rbox is not None)
     svg_s = be.get_string(page, settings=st, render_box=rbox)
     if not opts.get("mono"):
@@ -249,6 +308,177 @@ def _min_hatch_distance(doc):
     except Exception:
         pass
     return 0.0
+
+
+FACE_TYPES = {"3DFACE", "POLYLINE", "MESH", "POLYMESH", "POLYFACE"}
+
+
+def _is_face(e) -> bool:
+    t = e.dxftype()
+    if t == "3DFACE":
+        return True
+    if t == "POLYLINE":
+        try:
+            return e.is_poly_face_mesh or e.is_polygon_mesh
+        except Exception:
+            return False
+    return False
+
+
+def surface_model(msp, paper_2d=False) -> bool:
+    """A 3D surface model (3DFACE / polyface / polygon mesh, typical for SketchUp/3ds/old R12 exports):
+    the plan (top) view stacks every floor onto the roof outline - a meaningless web of triangle edges.
+    True when face entities dominate model space and the model is clearly three-dimensional."""
+    from ezdxf import bbox as bb
+    if paper_2d:
+        return False
+    n = faces = 0
+    for e in msp:
+        n += 1
+        faces += _is_face(e)
+    if not n or faces / n < 0.6:
+        return False
+    try:
+        ext = bb.extents(msp, fast=True)
+    except Exception:
+        return False
+    if not ext.has_data:
+        return False
+    sx, sy, sz = ext.size.x, ext.size.y, ext.size.z
+    return sz >= 0.25 * max(sx, sy, 1e-9)
+
+
+def _faces_3d(msp, limit=400_000):
+    """World-space polygons (faces) and polylines (edges) of a 3D model, INSERTs and meshes exploded."""
+    from ezdxf.disassemble import recursive_decompose
+    faces, lines = [], []
+    for e in recursive_decompose(msp):
+        if len(faces) + len(lines) >= limit:
+            break
+        t = e.dxftype()
+        try:
+            if t == "POLYLINE" and (e.is_poly_face_mesh or e.is_polygon_mesh):
+                for f in e.virtual_entities():
+                    v = [tuple(p) for p in f.wcs_vertices()]
+                    faces.append(v[:3] if v[3] == v[2] else v)
+            elif t in ("3DFACE", "SOLID", "TRACE"):
+                v = [tuple(p) for p in e.wcs_vertices()]
+                if len(v) == 4 and v[3] == v[2]:
+                    v = v[:3]
+                faces.append(v)
+            elif t == "LINE":
+                lines.append([tuple(e.dxf.start), tuple(e.dxf.end)])
+            elif t in ("POLYLINE", "LWPOLYLINE"):
+                pts = [tuple(p) for p in e.points_in_wcs()] if t == "LWPOLYLINE" else [tuple(v.dxf.location) for v in e.vertices]
+                if len(pts) > 1:
+                    lines.append(pts)
+        except Exception:
+            continue
+    return faces, lines
+
+
+def render_3d(doc, opts):
+    """Hidden-line isometric view (from the south-east, Z up) of a 3D surface model, one A3 page.
+    Painter's algorithm: faces sorted far-to-near, filled white with dark edges."""
+    import math
+    import numpy as np
+    faces, lines = _faces_3d(doc.modelspace())
+    if not faces:
+        raise CadError("3D model without faces", "cad_3d")
+    az, el = math.radians(-45), math.radians(35.264)
+    rz = np.array([[math.cos(az), -math.sin(az), 0], [math.sin(az), math.cos(az), 0], [0, 0, 1]])
+    up = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]])
+    rx = np.array([[1, 0, 0], [0, math.cos(el), -math.sin(el)], [0, math.sin(el), math.cos(el)]])
+    R = (rx @ up @ rz).T
+    P = [np.asarray(f, dtype=float) @ R for f in faces]
+    L = [np.asarray(l, dtype=float) @ R for l in lines]
+    allp = np.vstack(P + L)
+    mn, mx = allp[:, :2].min(0), allp[:, :2].max(0)
+    span = np.maximum(mx - mn, 1e-9)
+    w, h = PAGE_MM.get(opts.get("page", "auto"), PAGE_MM["a3"])
+    w, h = w * 72 / 25.4, h * 72 / 25.4
+    orient = opts.get("orient", "auto")
+    land = span[0] > span[1] if orient == "auto" else orient == "landscape"
+    if land != (w > h):
+        w, h = h, w
+    m = 8 * 72 / 25.4
+    s = min((w - 2 * m) / span[0], (h - 2 * m) / span[1])
+    ox, oy = (w - span[0] * s) / 2, (h - span[1] * s) / 2
+    lw = max(0.15, min(0.5, 1500 / max(len(P), 1)))
+    out = fitz.open()
+    pg = out.new_page(width=w, height=h)
+    sh = pg.new_shape()
+
+    def pts(a):
+        return [fitz.Point(ox + (x - mn[0]) * s, h - oy - (y - mn[1]) * s) for x, y in a[:, :2]]
+
+    items = [(f[:, 2].mean(), 0, f) for f in P] + [(l[:, 2].max(), 1, l) for l in L]
+    items.sort(key=lambda t: t[0])
+    color = (0, 0, 0)
+    for _, kind, a in items:
+        q = pts(a)
+        if kind == 0:
+            sh.draw_polyline(q + [q[0]])
+            sh.finish(color=color, fill=(1, 1, 1), width=lw, closePath=True, lineJoin=1)
+        else:
+            sh.draw_polyline(q)
+            sh.finish(color=color, width=lw, closePath=False)
+    sh.commit()
+    out.set_metadata({"producer": "kkultools CAD (ezdxf 3D view)"})
+    return out.tobytes(deflate=True, garbage=3)
+
+
+def warnings_for(doc) -> list:
+    """Things that render incompletely - shown to the user next to the result."""
+    w = []
+    try:
+        xrefs = {b.name for b in doc.blocks if b.block_record.is_xref}
+    except Exception:
+        xrefs = set()
+    if xrefs and any(e.dxftype() == "INSERT" and e.dxf.name in xrefs for e in doc.entitydb.values()):
+        w.append("cad_xref")
+    types = {e.dxftype() for e in doc.entitydb.values()}
+    if types & {"IMAGE", "PDFUNDERLAY", "DWFUNDERLAY", "DGNUNDERLAY", "OLE2FRAME", "OLEFRAME"}:
+        w.append("cad_image")
+    if types & {"3DSOLID", "BODY", "REGION", "SURFACE", "EXTRUDEDSURFACE", "LOFTEDSURFACE", "REVOLVEDSURFACE",
+                "SWEPTSURFACE", "PLANESURFACE", "NURBSURFACE"}:
+        w.append("cad_solid_part")
+    if types & {"ACAD_PROXY_ENTITY"}:
+        w.append("cad_proxy")
+    return w
+
+
+def sanity_check(pdf: bytes):
+    """Refuse a result that would mislead: a blank page, or a drawing squeezed into a speck because
+    stray far-away objects set the extents.  Checks each page at 36 dpi."""
+    with fitz.open("pdf", pdf) as d:
+        blank = speck = 0
+        for pg in d:
+            pix = pg.get_pixmap(dpi=36, colorspace=fitz.csGRAY, alpha=False)
+            buf, W, H = pix.samples, pix.width, pix.height
+            xs, ys, ink = [], [], 0
+            for y in range(H):
+                row = buf[y * pix.stride:y * pix.stride + W]
+                for x in range(W):
+                    if row[x] < 200:
+                        ink += 1
+                        xs.append(x)
+                        ys.append(y)
+            if ink < 3:
+                blank += 1
+                continue
+            # bounds of 98% of the ink (one far-off stray object must not count)
+            xs.sort(); ys.sort()
+            k = int(len(xs) * 0.01)
+            bw = (xs[-1 - k] - xs[k] + 1) / W
+            bh = (ys[-1 - k] - ys[k] + 1) / H
+            if max(bw, bh) < 0.12:
+                speck += 1
+        n = d.page_count
+    if blank == n:
+        raise CadError("rendered page is blank", "cad_blank")
+    if blank + speck == n:
+        raise CadError("drawing renders as a speck (far-away stray objects?)", "cad_speck")
 
 
 def render(doc, opts=None, fmt="pdf"):
@@ -279,6 +509,17 @@ def render(doc, opts=None, fmt="pdf"):
              "SWEPTSURFACE", "PLANESURFACE", "NURBSURFACE", "MESH", "LIGHT"}
     types = [e.dxftype() for e in msp]
     paper_2d = any(not m and any(e.dxftype() != "VIEWPORT" for e in lay) for lay, m in layouts)
+    if surface_model(msp, paper_2d) and opts.get("view3d", "auto") != "plan":
+        render.errors = []
+        render.view3d = True
+        pdf = render_3d(doc, opts)
+        if fmt == "pdf":
+            return pdf
+        with fitz.open("pdf", pdf) as d:
+            if fmt == "png":
+                return [d[0].get_pixmap(dpi=opts.get("dpi", 150), alpha=False).tobytes("png")]
+            return [d[0].get_svg_image(text_as_path=True).encode()]
+    render.view3d = False
     if types and sum(t in solid for t in types) / len(types) >= 0.5 and not paper_2d:
         # a 3D model with a few stray lines would come out as an almost blank page
         raise CadError("3D model (ACIS solids) - nothing meaningful to plot in 2D", "cad_3d")
@@ -289,6 +530,8 @@ def render(doc, opts=None, fmt="pdf"):
         except Exception as e:  # one bad layout must not kill the job
             errors.append(f"{lay.name}: {type(e).__name__}: {e}"[:200])
     render.errors = errors
+    render.outliers = getattr(_render_one, "outliers", False)
+    _render_one.outliers = False
     if not pages:
         if any("NaN" in e or "empty bounding box" in e for e in errors):
             raise CadError("no 2D content we can draw (3D solids/ACIS or empty viewports only)", "cad_3d")
@@ -418,6 +661,12 @@ def convert(src: str, dst: str, opts=None):
     with tempfile.TemporaryDirectory() as td:
         t0 = time.time()
         path = src
+        real = sniff(src)
+        if real and real != ext.lstrip("."):
+            info["renamed_from"] = real  # a DWG saved as .dxf (or the reverse)
+            ext = "." + real
+        elif not real:
+            raise CadError("not a DXF/DWG file", "cad_read")
         if ext == ".dwg":
             path = dwg_to_dxf(src, td)
             info["t_dwg2dxf"] = round(time.time() - t0, 2)
@@ -427,13 +676,20 @@ def convert(src: str, dst: str, opts=None):
         info["acad_release"] = doc.acad_release
         info["audit_errors"] = len(aud.errors)
         info["ko_styles"] = fix_korean_fonts(doc)
+        info["warnings"] = warnings_for(doc)
         info["t_load"] = round(time.time() - t1, 2)
         t2 = time.time()
         fmt = os.path.splitext(dst)[1].lstrip(".").lower()
         res = render(doc, opts, fmt)
         info["t_render"] = round(time.time() - t2, 2)
         info["layout_errors"] = getattr(render, "errors", [])
+        info["view3d"] = getattr(render, "view3d", False)
+        if info["view3d"]:
+            info["warnings"].append("cad_view3d")
+        if getattr(render, "outliers", False):
+            info["warnings"].append("cad_outliers")
         if isinstance(res, bytes):
+            sanity_check(res)
             open(dst, "wb").write(res)
             info["pages"] = fitz.open(dst).page_count
         else:

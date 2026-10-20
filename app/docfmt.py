@@ -539,6 +539,14 @@ def convert(src, src_ext, dst_ext, work):
     raise ConvertError(f"unsupported conversion: {src_ext} -> {dst_ext}")
 
 
+def _cad_warn(work, info):
+    """Warning codes (cad_xref, cad_view3d, ...) for the result page; app.py sends them as x-kkul-warn."""
+    w = [c for c in (info or {}).get("warnings", []) if re.fullmatch(r"cad_[a-z0-9_]+", c)]
+    if w:
+        with open(os.path.join(work, "cad_warn"), "w") as f:
+            f.write(",".join(dict.fromkeys(w)))
+
+
 def cad_convert(src, src_ext, dst_ext, work):
     """DWG/DXF -> PDF (model space + each used layout = one page each), PNG/SVG (zip when several pages).
     Options come from the CAD_OPTS env (JSON, already whitelisted by app.py)."""
@@ -551,10 +559,11 @@ def cad_convert(src, src_ext, dst_ext, work):
     try:
         if dst_ext == "png":
             pdf = os.path.join(work, "cad.pdf")
-            cadconv.convert(src, pdf, opts)
+            _cad_warn(work, cadconv.convert(src, pdf, opts))
             return pages_to_images(pdf, "png", work)
         out = os.path.join(work, f"out.{dst_ext}")
-        cadconv.convert(src, out, opts)
+        info = cadconv.convert(src, out, opts)
+        _cad_warn(work, info)
     except cadconv.CadError as e:
         raise ConvertError(f"kkul:{e.code} {e}")
     if dst_ext == "svg":
