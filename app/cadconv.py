@@ -15,6 +15,18 @@ from ezdxf.addons.drawing import Frontend, RenderContext, layout, config
 import pymupdf as fitz
 
 KO_TTF = "NanumGothic.ttf"
+
+
+def _ensure_font_cache():
+    """A stale ezdxf font cache (built before fonts-nanum) silently draws Hangul as boxes."""
+    from ezdxf.fonts import fonts
+    try:
+        if fonts.find_font_face(KO_TTF).filename != KO_TTF:
+            fonts.build_system_font_cache()
+            fonts.font_manager.clear() if hasattr(fonts.font_manager, "clear") else None
+            fonts.load()
+    except Exception:
+        pass
 HANGUL = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7a3]")
 # common Korean CAD fonts (SHX big fonts and Windows TTF) -> installed Nanum
 KO_FONT_HINT = re.compile(r"^(whg|hg|kor|han|ksc|gulim|batang|dotum|gungsuh|malgun|굴림|돋움|바탕|궁서|맑은|hy|h2|hm)", re.I)
@@ -83,6 +95,32 @@ def load(path: str):
     except Exception as e:  # noqa
         raise CadError(f"cannot read DXF: {e}", "cad_read")
     return doc, auditor
+
+
+_UESC = re.compile(r"\\U\+([0-9A-Fa-f]{4})")
+
+
+def decode_unicode_escapes(doc) -> int:
+    """DXF before R2007 stores non-ASCII text (Hangul) as \\U+XXXX; the renderer would print the
+    escape literally ("\\U+D55C"), so turn it back into the character."""
+    n = 0
+    for e in doc.entitydb.values():
+        t = e.dxftype()
+        attr = "text" if t in ("TEXT", "ATTRIB", "ATTDEF", "MTEXT") else None
+        if attr is None:
+            continue
+        try:
+            v = e.text if t == "MTEXT" else e.dxf.get("text", "")
+        except Exception:
+            continue
+        if v and "\\U+" in v:
+            nv = _UESC.sub(lambda m: chr(int(m.group(1), 16)), v)
+            if t == "MTEXT":
+                e.text = nv
+            else:
+                e.dxf.text = nv
+            n += 1
+    return n
 
 
 def fix_korean_fonts(doc) -> int:
@@ -675,6 +713,8 @@ def convert(src: str, dst: str, opts=None):
         info["dxfversion"] = doc.dxfversion
         info["acad_release"] = doc.acad_release
         info["audit_errors"] = len(aud.errors)
+        _ensure_font_cache()
+        info["u_escapes"] = decode_unicode_escapes(doc)
         info["ko_styles"] = fix_korean_fonts(doc)
         info["warnings"] = warnings_for(doc)
         info["t_load"] = round(time.time() - t1, 2)
